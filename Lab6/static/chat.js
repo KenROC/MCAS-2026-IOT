@@ -99,7 +99,7 @@ form.addEventListener(
             }
 
             addMessage(
-                "Gemini："
+                (data.bot || "Gemini") + "："
                 + data.reply,
                 "ai"
             );

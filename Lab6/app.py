@@ -1,4 +1,8 @@
+import json
 import os
+import urllib.error
+import urllib.request
+import uuid
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -11,7 +15,6 @@ from flask import (
     session,
     url_for,
 )
-from google import genai
 
 
 # =========================
@@ -20,16 +23,26 @@ from google import genai
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SECRET_KEY = os.getenv("SECRET_KEY")
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash",
+# OpenRouter（OpenAI 相容 Chat Completions API）
+# API Key 申請：https://openrouter.ai/keys
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_BASE_URL = os.getenv(
+    "OPENROUTER_BASE_URL",
+    "https://openrouter.ai/api/v1",
+).rstrip("/")
+# 模型清單：https://openrouter.ai/models
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "openai/gpt-4o-mini",
 )
+SECRET_KEY = os.getenv("SECRET_KEY")
 
-if not GEMINI_API_KEY:
+if (
+    not OPENROUTER_API_KEY
+    or OPENROUTER_API_KEY == "YOUR_API_KEY_HERE"
+):
     raise RuntimeError(
-        "找不到 GEMINI_API_KEY，請先建立 .env 並填入 API Key。"
+        "找不到 OPENROUTER_API_KEY，請先建立 .env 並填入 API Key。"
     )
 
 if not SECRET_KEY or SECRET_KEY == "CHANGE_ME":
@@ -54,42 +67,90 @@ USERS = {
 
 
 # =========================
-# Gemini
+# OpenRouter
 # =========================
 
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+# Flask 預設 Session 存在 Cookie（約 4KB 上限），
+# 所以對話歷史存在伺服器記憶體，Session 只存對話 ID。
+CONVERSATIONS = {}
+MAX_HISTORY = 20
 
 
-def ask_gemini(
+def ask_openrouter(
     message,
-    previous_interaction_id=None,
+    conversation_id=None,
 ):
-    params = {
-        "model": GEMINI_MODEL,
-        "input": message,
+    if not conversation_id:
+        conversation_id = uuid.uuid4().hex
+
+    history = CONVERSATIONS.setdefault(
+        conversation_id, []
+    )
+    history.append({
+        "role": "user",
+        "content": message,
+    })
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + OPENROUTER_API_KEY,
+        # 以下兩個為 OpenRouter 選填標頭（用於排行榜顯示）
+        "HTTP-Referer": "http://localhost:3000",
+        "X-Title": "Lab6 Flask Chat",
     }
 
-    if previous_interaction_id:
-        params["previous_interaction_id"] = (
-            previous_interaction_id
-        )
-
-    interaction = (
-        gemini_client.interactions.create(
-            **params
-        )
+    req = urllib.request.Request(
+        OPENROUTER_BASE_URL + "/chat/completions",
+        data=json.dumps({
+            "model": OPENROUTER_MODEL,
+            "messages": history[-MAX_HISTORY:],
+        }).encode("utf-8"),
+        headers=headers,
+        method="POST",
     )
 
+    try:
+        with urllib.request.urlopen(
+            req, timeout=60
+        ) as resp:
+            result = json.loads(
+                resp.read().decode("utf-8")
+            )
+    except urllib.error.HTTPError as error:
+        # 失敗時移除這次提問，避免歷史錯亂
+        history.pop()
+        detail = error.read().decode(
+            "utf-8", errors="replace"
+        )
+        raise RuntimeError(
+            f"HTTP {error.code}: {detail}"
+        ) from error
+    except Exception:
+        history.pop()
+        raise
+
     reply = (
-        interaction.output_text or ""
+        result["choices"][0]["message"]
+        .get("content") or ""
     ).strip()
 
     if not reply:
-        reply = "Gemini 沒有回傳文字內容。"
+        reply = "模型沒有回傳文字內容。"
 
-    return reply, interaction.id
+    history.append({
+        "role": "assistant",
+        "content": reply,
+    })
+    del history[:-MAX_HISTORY]
+
+    return reply, conversation_id
+
+
+def ask_llm(message, previous_id=None):
+    return ask_openrouter(message, previous_id)
+
+
+BOT_NAME = OPENROUTER_MODEL
 
 
 # =========================
@@ -184,7 +245,7 @@ def chat_room():
 
 
 # =========================
-# Gemini API
+# Chat API (OpenRouter)
 # =========================
 
 @app.post("/api/chat")
@@ -215,11 +276,11 @@ def api_chat():
     try:
 
         previous_id = session.get(
-            "gemini_interaction_id"
+            "conversation_id"
         )
 
         reply, interaction_id = (
-            ask_gemini(
+            ask_llm(
                 message,
                 previous_id,
             )
@@ -228,23 +289,24 @@ def api_chat():
         # 保存本次 interaction ID
         # 下一輪即可延續對話
         session[
-            "gemini_interaction_id"
+            "conversation_id"
         ] = interaction_id
 
         return jsonify({
-            "reply": reply
+            "reply": reply,
+            "bot": BOT_NAME,
         })
 
     except Exception as error:
 
         print(
-            "[Gemini API Error]",
+            "[LLM API Error]",
             error,
         )
 
         return jsonify({
             "error":
-            "Gemini API 呼叫失敗，"
+            f"{BOT_NAME} API 呼叫失敗，"
             "請檢查 API Key、網路或模型設定。"
         }), 502
 
@@ -257,10 +319,13 @@ def api_chat():
 @login_required
 def reset_chat():
 
-    session.pop(
-        "gemini_interaction_id",
+    old_id = session.pop(
+        "conversation_id",
         None,
     )
+
+    # 進階題：同時清除伺服器端的歷史
+    CONVERSATIONS.pop(old_id, None)
 
     return jsonify({
         "ok": True
@@ -290,6 +355,13 @@ if __name__ == "__main__":
 
     print(
         "=== Lab6 Flask Server ==="
+    )
+
+    print(
+        "LLM Provider: "
+        + "openrouter"
+        + " / Model: "
+        + OPENROUTER_MODEL
     )
 
     print(
